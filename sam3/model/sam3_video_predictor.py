@@ -71,6 +71,7 @@ class Sam3VideoPredictor:
                 bounding_boxes=request.get("bounding_boxes", None),
                 bounding_box_labels=request.get("bounding_box_labels", None),
                 obj_id=request.get("obj_id", None),
+                is_a_visual_prompt=request.get("is_a_visual_prompt", True),
             )
         elif request_type == "remove_object":
             return self.remove_object(
@@ -138,6 +139,7 @@ class Sam3VideoPredictor:
         bounding_boxes: Optional[List[List[float]]] = None,
         bounding_box_labels: Optional[List[int]] = None,
         obj_id: Optional[int] = None,
+        is_a_visual_prompt: bool = True,
     ):
         """Add text, box and/or point prompt on a specific video frame."""
         logger.debug(
@@ -157,6 +159,7 @@ class Sam3VideoPredictor:
             boxes_xywh=bounding_boxes,
             box_labels=bounding_box_labels,
             obj_id=obj_id,
+            is_a_visual_prompt=is_a_visual_prompt,
         )
         return {"frame_index": frame_idx, "outputs": outputs}
 

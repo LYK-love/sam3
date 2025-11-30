@@ -175,7 +175,96 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["visual_prompt_embed"] = None
         inference_state["visual_prompt_mask"] = None
 
-    def _get_visual_prompt(self, inference_state, frame_idx, boxes_cxcywh, box_labels):
+    def _get_visual_prompt(
+        self,
+        boxes_cxcywh: torch.Tensor,  # (num_boxes, 4)
+        box_labels: torch.Tensor,  # (num_boxes,)
+    ):
+        """
+        构造 visual prompt（起始 box prompt），要求只有一个 box。
+
+        返回:
+            Prompt 对象，形状为:
+                box_embeddings: (seq=1, bs=1, 4)
+                box_labels:     (seq=1, bs=1)
+        """
+        device = self.device
+
+        if boxes_cxcywh.size(0) != 1:
+            raise RuntimeError(
+                "visual prompts must contain exactly one box, "
+                f"but got {boxes_cxcywh.shape=}"
+            )
+
+        if not box_labels.item():
+            logging.warning("A negative box is added as a visual prompt.")
+
+        return Prompt(
+            box_embeddings=boxes_cxcywh[None, 0:1, :].to(
+                device
+            ),  # (seq, bs, 4) = (1,1,4)
+            box_mask=None,
+            box_labels=box_labels[None, 0:1].to(device),  # (seq, bs) = (1,1)
+            point_embeddings=None,
+            point_mask=None,
+            point_labels=None,
+        )
+
+    def _build_geometry_prompt(
+        self, boxes_cxcywh: torch.Tensor, box_labels: torch.Tensor
+    ):
+        """
+        构造几何 prompt（boxes），适配 SequenceGeometryEncoder / Prompt 的预期 shape。
+
+        输入:
+            boxes_cxcywh: [N, 4]，归一化到 [0,1] 的 (cx, cy, w, h)
+            box_labels:   [N]，0/1 或 long dtype，正负框标签
+
+        输出:
+            geo_prompt: geometry_encoders.Prompt 实例
+        """
+        if boxes_cxcywh is None or boxes_cxcywh.numel() == 0:
+            # 没有几何信息，返回“空 prompt”
+            return Prompt()
+
+        # 保证 tensor & dtype 正确
+        boxes_cxcywh = boxes_cxcywh.to(dtype=torch.float32, device=self.device)
+        box_labels = box_labels.to(dtype=torch.long, device=self.device)
+
+        N = boxes_cxcywh.shape[0]
+        B = 1  # 单张图，batch size = 1
+
+        # shape: [N, 1, 4]
+        box_embeddings = boxes_cxcywh.view(N, 1, 4)
+
+        # labels: [N, 1]
+        box_labels_2d = box_labels.view(N, 1)
+
+        # mask: [1, N]，False 表示有效（未 pad）
+        box_mask = torch.zeros(B, N, dtype=torch.bool, device=self.device)
+
+        geo_prompt = Prompt(
+            box_embeddings=box_embeddings,  # [N, 1, 4]
+            box_labels=box_labels_2d,  # [N, 1]
+            box_mask=box_mask,  # [1, N]
+            point_embeddings=None,
+            point_labels=None,
+            point_mask=None,
+            mask_embeddings=None,
+            mask_labels=None,
+            mask_mask=None,
+        )
+
+        return geo_prompt
+
+    def _get_visual_prompt_old(
+        self,
+        inference_state,
+        frame_idx,
+        boxes_cxcywh,
+        box_labels,
+        is_a_visual_prompt: bool = True,
+    ):
         """
         Handle the case of visual prompt. Currently, in the inference API we do not
         explicitly distinguish between initial box as visual prompt vs subsequent boxes
@@ -188,7 +277,9 @@ class Sam3VideoInference(Sam3VideoBase):
             inference_state["per_frame_visual_prompt"][frame_idx] is None
             and inference_state["previous_stages_out"][frame_idx] is None
         )
-        if is_new_visual_prompt:
+        device = self.device
+
+        if is_new_visual_prompt and is_a_visual_prompt:
             if boxes_cxcywh.size(0) != 1:
                 raise RuntimeError(
                     "visual prompts (box as an initial prompt) should only have one box, "
@@ -197,7 +288,6 @@ class Sam3VideoInference(Sam3VideoBase):
             if not box_labels.item():
                 logging.warning("A negative box is added as a visual prompt.")
             # take the first box prompt as a visual prompt
-            device = self.device
             new_visual_prompt = Prompt(
                 box_embeddings=boxes_cxcywh[None, 0:1, :].to(device),  # (seq, bs, 4)
                 box_mask=None,
@@ -208,8 +298,19 @@ class Sam3VideoInference(Sam3VideoBase):
             )
             inference_state["per_frame_visual_prompt"][frame_idx] = new_visual_prompt
         else:
-            new_visual_prompt = None
+            geometry_prompt = Prompt(
+                box_embeddings=boxes_cxcywh[None, :, :].to(device),  # (seq, bs, 4)
+                box_mask=None,
+                box_labels=box_labels[None, :].to(device),  # (seq, bs)
+                point_embeddings=None,
+                point_mask=None,
+                point_labels=None,
+            )
+            inference_state["per_frame_visual_prompt"][frame_idx] = None
 
+            new_visual_prompt = geometry_prompt
+
+        # Don't know why they wrote this
         # `boxes_cxcywh` and `box_labels` contains all the raw box inputs added so far
         # strip any visual prompt from the input boxes (for geometric prompt encoding)
         if inference_state["per_frame_visual_prompt"][frame_idx] is not None:
@@ -841,63 +942,157 @@ class Sam3VideoInference(Sam3VideoBase):
         text_str=None,
         boxes_xywh=None,
         box_labels=None,
+        has_a_visual_prompt=True,
     ):
         """
-        Add text, point or box prompts on a single frame. This method returns the inference
-        outputs only on the prompted frame.
+        Add a prompt on a single frame.
 
-        Note that text prompts are NOT associated with a particular frame (i.e. they apply
-        to all frames). However, we only run inference on the frame specified in `frame_idx`.
+        规则说明（本函数的语义）：
+
+        - text prompt 与 visual prompt 互斥，用于决定本次调用是否作为「起始 prompt」，
+          以及使用 TEXT_ID_FOR_TEXT 还是 TEXT_ID_FOR_VISUAL：
+            1) text prompt:
+                - text_str is not None 且 text_str != "visual"
+                - 可选 boxes_xywh（此时这些 boxes 视为 geometry prompt）
+                - 视为 session 起始 prompt，会 reset_state
+
+            2) visual prompt:
+                - text_str is None
+                - boxes_xywh is not None
+                - is_a_visual_prompt == True
+                - 且 boxes_xywh 至少含 1 个 box
+                - 第 1 个 box 视为 visual prompt，后续 box 视为 geometry prompt
+                - 视为 session 起始 prompt，会 reset_state
+
+            3) geometry-only prompt（refinement）:
+                - text_str is None
+                - boxes_xywh is not None
+                - is_a_visual_prompt == False
+                - 所有 boxes 视为 geometry prompt
+                - 视为 refinement，不会 reset_state
+
+        - text prompt 和 visual prompt 互斥，但它们都可以「附带」geometry prompt：
+            - text + boxes      => text 起始 + geometry prompt
+            - visual + N boxes  => 第 1 个是 visual，其余 N-1 个是 geometry
+
+        Args:
+            has_a_visual_prompt: 这个只在纯box prompts中起作用, 表明该box prompt中是否含有一个visual prompt
         """
+
         logger.debug("Running add_prompt on frame %d", frame_idx)
 
         num_frames = inference_state["num_frames"]
         assert (
-            text_str is not None or boxes_xywh is not None
-        ), "at least one type of prompt (text, boxes) must be provided"
-        assert (
             0 <= frame_idx < num_frames
         ), f"{frame_idx=} is out of range for a total of {num_frames} frames"
 
-        # since it's a semantic prompt, we start over
-        self.reset_state(inference_state)
+        # 注意：这里继续沿用你原来的逻辑，text_str == "visual" 不算真正的 text prompt
+        has_text = text_str is not None and text_str != "visual"
+        has_boxes = boxes_xywh is not None
 
-        # 1) add text prompt
-        if text_str is not None and text_str != "visual":
-            inference_state["text_prompt"] = text_str
-            inference_state["input_batch"].find_text_batch[0] = text_str
-            text_id = self.TEXT_ID_FOR_TEXT
-        else:
-            inference_state["text_prompt"] = None
-            inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
-            text_id = self.TEXT_ID_FOR_VISUAL
-        for t in range(inference_state["num_frames"]):
-            inference_state["input_batch"].find_inputs[t].text_ids[...] = text_id
+        # ---- 合法性检查 ----
+        if (not has_text) and (not has_boxes):
+            raise ValueError(
+                "Sam3VideoInference.add_prompt: at least one type of prompt "
+                "(text or boxes) must be provided."
+            )
+        if has_text and has_a_visual_prompt:
+            raise ValueError(
+                "Sam3VideoInference.add_prompt: text prompt and visual prompt "
+                "cannot be provided at the same time."
+            )
 
-        # 2) handle box prompt
-        assert (boxes_xywh is not None) == (box_labels is not None)
-        if boxes_xywh is not None:
+        # 是否是「起始 prompt」：有 text，或者声明了 visual prompt
+        is_session_init = has_text or (
+            has_boxes and has_a_visual_prompt and not has_text
+        )
+
+        # ---- 起始 prompt：text / visual（会 reset_state）----
+        if is_session_init:
+            # 重置整个 session 到 init_state
+            self.reset_state(inference_state)
+
+            if has_text:
+                # text 起始：设置文本提示
+                inference_state["text_prompt"] = text_str
+                inference_state["input_batch"].find_text_batch[0] = text_str
+                text_id = self.TEXT_ID_FOR_TEXT  # = 0
+            else:
+                # visual 起始：不使用自然语言文本，只用 visual prompt
+                inference_state["text_prompt"] = None
+                inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
+                text_id = self.TEXT_ID_FOR_VISUAL  # = 1
+
+            # 所有 frame 共用同一个 text_id
+            for t in range(num_frames):
+                inference_state["input_batch"].find_inputs[t].text_ids[...] = text_id
+
+        # ---- 处理 box prompt（visual / geometry 共用前处理）----
+        if has_boxes:
             boxes_xywh = torch.as_tensor(boxes_xywh, dtype=torch.float32)
             box_labels = torch.as_tensor(box_labels, dtype=torch.long)
-            # input boxes are expected to be [xmin, ymin, width, height] format
-            # in normalized coordinates of range 0~1, similar to FA
+
+            # input boxes are expected to be [xmin, ymin, width, height] in [0,1]
             assert boxes_xywh.dim() == 2
             assert boxes_xywh.size(0) > 0 and boxes_xywh.size(-1) == 4
             assert box_labels.dim() == 1 and box_labels.size(0) == boxes_xywh.size(0)
-            boxes_cxcywh = box_xywh_to_cxcywh(boxes_xywh)
+
             assert (boxes_xywh >= 0).all().item() and (boxes_xywh <= 1).all().item()
+
+            boxes_cxcywh = box_xywh_to_cxcywh(boxes_xywh)
             assert (boxes_cxcywh >= 0).all().item() and (boxes_cxcywh <= 1).all().item()
 
-            new_box_input = boxes_cxcywh, box_labels
+            # 把“原始 box 输入”缓存下来（保留全部 box，方便后续使用或调试）
+            new_box_input = (boxes_cxcywh, box_labels)
             inference_state["per_frame_raw_box_input"][frame_idx] = new_box_input
 
-            # handle the case of visual prompt (also added as an input box from the UI)
-            boxes_cxcywh, box_labels, geometric_prompt = self._get_visual_prompt(
-                inference_state, frame_idx, boxes_cxcywh, box_labels
-            )
+            # --- 情况 A：visual 起始（可附带 geometry）---
+            if has_a_visual_prompt:
+                if boxes_cxcywh.size(0) < 1:
+                    raise RuntimeError(
+                        "Visual prompt must contain at least one box, "
+                        f"but got {boxes_cxcywh.shape=}"
+                    )
 
-            inference_state["per_frame_geometric_prompt"][frame_idx] = geometric_prompt
+                # 第一个 box 作为 visual prompt
+                visual_boxes = boxes_cxcywh[0:1]
+                visual_labels = box_labels[0:1]
+                visual_prompt = self._get_visual_prompt(visual_boxes, visual_labels)
+                inference_state["per_frame_visual_prompt"][frame_idx] = visual_prompt
 
+                # 若还有更多 box，则作为 geometry prompt
+                if boxes_cxcywh.size(0) > 1:
+                    geo_boxes = boxes_cxcywh[1:]
+                    geo_labels = box_labels[1:]
+                    geometry_prompt = self._build_geometry_prompt(geo_boxes, geo_labels)
+                    inference_state["per_frame_geometric_prompt"][
+                        frame_idx
+                    ] = geometry_prompt
+
+            # --- 情况 B：text 起始 + geometry boxes ---
+            elif has_text and has_boxes:
+                # text prompt 已经在上面处理，这里所有 box 都视为 geometry
+                geometry_prompt = self._build_geometry_prompt(boxes_cxcywh, box_labels)
+                inference_state["per_frame_geometric_prompt"][
+                    frame_idx
+                ] = geometry_prompt
+
+            # --- 情况 C：纯 geometry refine（不重置 session）---
+            elif (not has_text) and (not has_a_visual_prompt):
+                geometry_prompt = self._build_geometry_prompt(boxes_cxcywh, box_labels)
+                inference_state["per_frame_geometric_prompt"][
+                    frame_idx
+                ] = geometry_prompt
+
+            else:
+                # 理论上不会走到这里，如果走到说明逻辑前面有遗漏的分支
+                raise RuntimeError(
+                    f"Unexpected combination in add_prompt: "
+                    f"has_text={has_text}, has_boxes={has_boxes}, "
+                    f"is_a_visual_prompt={has_a_visual_prompt}"
+                )
+
+        # ---- 真正跑一遍当前 frame 的检测/跟踪 ----
         out = self._run_single_frame_inference(
             inference_state, frame_idx, reverse=False
         )
@@ -1365,6 +1560,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         point_labels=None,
         obj_id=None,
         rel_coordinates=True,
+        is_a_visual_prompt=True,
     ):
         if points is not None:
             # Tracker instance prompts
@@ -1391,6 +1587,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 text_str=text_str,
                 boxes_xywh=boxes_xywh,
                 box_labels=box_labels,
+                has_a_visual_prompt=is_a_visual_prompt,
             )
 
     @torch.inference_mode()
